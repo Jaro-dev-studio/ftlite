@@ -314,25 +314,40 @@ export function GameCanvas() {
         drawShip(ctx, enemyShipCopy, targetedRoomId, !!targetingWeaponId, originalEnemyPos);
       }
 
-      // Draw projectiles (adjust positions based on which ship they're related to)
+      // Draw projectiles (adjust positions based on source and target ships)
+      const playerOffsetX = playerX - RENDER.PLAYER_SHIP_X;
+      const playerOffsetY = (centerY - 100) - RENDER.SHIP_Y;
+      const enemyOffsetX = enemyX - RENDER.ENEMY_SHIP_X;
+      const enemyOffsetY = (centerY - 100) - RENDER.SHIP_Y;
+
       const adjustedProjectiles = projectiles.map(p => {
-        // Determine offsets based on source and target
-        const offsetX = playerX - RENDER.PLAYER_SHIP_X;
-        const offsetY = (centerY - 100) - RENDER.SHIP_Y;
+        // Start offset based on source ship
+        const isPlayerSource = p.sourceShipId === playerShip.id;
+        const startOffsetX = isPlayerSource ? playerOffsetX : enemyOffsetX;
+        const startOffsetY = isPlayerSource ? playerOffsetY : enemyOffsetY;
+        
+        // End offset based on target ship
+        const isPlayerTarget = p.targetShipId === playerShip.id;
+        const endOffsetX = isPlayerTarget ? playerOffsetX : enemyOffsetX;
+        const endOffsetY = isPlayerTarget ? playerOffsetY : enemyOffsetY;
+        
+        // Current position offset - interpolate based on progress
+        const currentOffsetX = startOffsetX + (endOffsetX - startOffsetX) * p.progress;
+        const currentOffsetY = startOffsetY + (endOffsetY - startOffsetY) * p.progress;
         
         return {
           ...p,
           position: {
-            x: p.position.x + offsetX,
-            y: p.position.y + offsetY,
+            x: p.position.x + currentOffsetX,
+            y: p.position.y + currentOffsetY,
           },
           startPosition: {
-            x: p.startPosition.x + offsetX,
-            y: p.startPosition.y + offsetY,
+            x: p.startPosition.x + startOffsetX,
+            y: p.startPosition.y + startOffsetY,
           },
           endPosition: {
-            x: p.endPosition.x + offsetX,
-            y: p.endPosition.y + offsetY,
+            x: p.endPosition.x + endOffsetX,
+            y: p.endPosition.y + endOffsetY,
           },
         };
       });
