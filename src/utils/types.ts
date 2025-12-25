@@ -33,6 +33,7 @@ export interface Crew {
   position: Position;
   isSelected: boolean;
   isPlayer: boolean;
+  doorWaypoint: Position | null; // Current door position to pass through
 }
 
 export interface Door {
@@ -56,6 +57,7 @@ export interface Room {
   fire: number;
   breach: boolean;
   crewInRoom: string[];
+  manningTileIndex: number; // The tile index where crew must stand to man this room
 }
 
 export interface ShipSystem {
@@ -77,8 +79,9 @@ export interface Weapon {
   damage: number;
   chargeTime: number;
   currentCharge: number;
-  powered: boolean;
+  powered: boolean; // true when currentPower === powerRequired
   powerRequired: number;
+  currentPower: number; // 0 to powerRequired
   targetRoom: string | null;
   targetShipId: string | null;
   missilesCost: number;
@@ -166,4 +169,5 @@ export interface GameState {
   // UI State
   selectedCrewId: string | null;
   targetingWeaponId: string | null;
+  autofire: boolean;
 }

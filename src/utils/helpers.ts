@@ -1,6 +1,6 @@
 // Utility helper functions
 
-import { Position, Room, Ship, SystemType } from './types';
+import { Position, Room, Ship, SystemType, Door } from './types';
 import { RENDER, BALANCE } from './constants';
 
 // Generate unique IDs
@@ -47,6 +47,30 @@ export function getRoomCenter(room: Room, shipX: number, shipY: number): Positio
   };
 }
 
+// Get a specific tile position within a room (for crew positioning)
+// tileIndex is 0-based, tiles are numbered left-to-right, top-to-bottom
+export function getRoomTilePosition(
+  room: Room,
+  shipX: number,
+  shipY: number,
+  tileIndex: number = 0
+): Position {
+  const tilesPerRow = room.width;
+  const tileRow = Math.floor(tileIndex / tilesPerRow);
+  const tileCol = tileIndex % tilesPerRow;
+  
+  // Clamp to valid tile
+  const maxTiles = room.width * room.height;
+  const clampedIndex = Math.min(tileIndex, maxTiles - 1);
+  const clampedRow = Math.floor(clampedIndex / tilesPerRow);
+  const clampedCol = clampedIndex % tilesPerRow;
+  
+  return {
+    x: shipX + (room.gridX + clampedCol) * RENDER.TILE_SIZE + RENDER.TILE_SIZE / 2,
+    y: shipY + (room.gridY + clampedRow) * RENDER.TILE_SIZE + RENDER.TILE_SIZE / 2,
+  };
+}
+
 // Get room bounds in pixels
 export function getRoomBounds(room: Room, shipX: number, shipY: number) {
   return {
@@ -68,6 +92,41 @@ export function isPointInRoom(point: Position, room: Room, shipX: number, shipY:
   );
 }
 
+// Get the pixel position of a door (for crew to walk through)
+export function getDoorPixelPosition(door: Door, shipX: number, shipY: number): Position {
+  return {
+    x: shipX + door.position.x * RENDER.TILE_SIZE,
+    y: shipY + door.position.y * RENDER.TILE_SIZE,
+  };
+}
+
+// Find the door connecting two rooms
+export function findDoorBetweenRooms(room1Id: string, room2Id: string, doors: Door[]): Door | null {
+  return doors.find(d => 
+    (d.room1Id === room1Id && d.room2Id === room2Id) ||
+    (d.room1Id === room2Id && d.room2Id === room1Id)
+  ) || null;
+}
+
+// Get the pixel position of the manning tile in a room
+export function getManningTilePosition(room: Room, shipX: number, shipY: number): Position {
+  return getRoomTilePosition(room, shipX, shipY, room.manningTileIndex);
+}
+
+// Check if a crew member is on the manning tile of their room
+export function isCrewOnManningTile(
+  crewPosition: Position,
+  room: Room,
+  shipX: number,
+  shipY: number,
+  tolerance: number = 5
+): boolean {
+  const manningPos = getManningTilePosition(room, shipX, shipY);
+  const dx = Math.abs(crewPosition.x - manningPos.x);
+  const dy = Math.abs(crewPosition.y - manningPos.y);
+  return dx < tolerance && dy < tolerance;
+}
+
 // Find which room contains a point
 export function findRoomAtPoint(point: Position, ship: Ship): Room | null {
   for (const room of ship.rooms) {
@@ -78,13 +137,19 @@ export function findRoomAtPoint(point: Position, ship: Ship): Room | null {
   return null;
 }
 
-// Calculate ship evasion
+// Calculate ship evasion - returns 0 if engines have no power or are broken
 export function calculateEvasion(ship: Ship): number {
   const engines = ship.systems.engines;
   const piloting = ship.systems.piloting;
 
-  if (!piloting || piloting.powerCurrent === 0) {
-    return 0; // Can't evade without piloting
+  // No evasion without working piloting system
+  if (!piloting || piloting.powerCurrent === 0 || piloting.health === 0) {
+    return 0;
+  }
+
+  // No evasion without working engines
+  if (!engines || engines.powerCurrent === 0 || engines.health === 0) {
+    return 0;
   }
 
   let evasion = BALANCE.BASE_EVASION;
@@ -106,11 +171,14 @@ export function calculatePowerUsed(ship: Ship): number {
   for (const systemType of Object.keys(ship.systems) as SystemType[]) {
     total += ship.systems[systemType].powerCurrent;
   }
-  // Add weapon power
+  return total;
+}
+
+// Calculate total weapon power used across all weapons (must not exceed weapons system power)
+export function calculateWeaponPowerUsed(ship: Ship): number {
+  let total = 0;
   for (const weapon of ship.weapons) {
-    if (weapon.powered) {
-      total += weapon.powerRequired;
-    }
+    total += weapon.currentPower;
   }
   return total;
 }

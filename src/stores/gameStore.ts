@@ -3,7 +3,7 @@
 import { create } from 'zustand';
 import { GameState, Ship, Projectile, SystemType } from '@/utils/types';
 import { createPlayerShip, createEnemyShip } from '@/game/data/ships';
-import { calculateEvasion, calculatePowerUsed, generateId, checkHit, getRoomCenter } from '@/utils/helpers';
+import { calculateEvasion, calculatePowerUsed, calculateWeaponPowerUsed, generateId, checkHit, getRoomCenter, getRoomTilePosition, getDoorPixelPosition, findDoorBetweenRooms, isCrewOnManningTile, getManningTilePosition } from '@/utils/helpers';
 import { findPathImproved } from '@/game/crew/Pathfinding';
 import { BALANCE, RENDER } from '@/utils/constants';
 import { canFireWeapon } from '@/game/data/weapons';
@@ -20,6 +20,7 @@ interface GameActions {
   // Power management
   setPowerLevel: (systemType: SystemType, power: number) => void;
   toggleWeaponPower: (weaponId: string) => void;
+  setWeaponPower: (weaponId: string, power: number) => void;
 
   // Crew management
   selectCrew: (crewId: string | null) => void;
@@ -31,6 +32,7 @@ interface GameActions {
   fireWeapon: (weaponId: string) => void;
   startTargeting: (weaponId: string) => void;
   cancelTargeting: () => void;
+  toggleAutofire: () => void;
 
   // Doors
   toggleDoor: (doorId: string) => void;
@@ -58,6 +60,7 @@ const initialState: GameState = {
   projectiles: [],
   selectedCrewId: null,
   targetingWeaponId: null,
+  autofire: false,
 };
 
 export const useGameStore = create<GameState & GameActions>((set, get) => ({
@@ -117,6 +120,51 @@ export const useGameStore = create<GameState & GameActions>((set, get) => ({
         return state; // Not enough power
       }
 
+      let updatedWeapons = [...ship.weapons];
+
+      // Special handling for weapons system - auto-allocate/deallocate to individual weapons
+      if (systemType === 'weapons') {
+        const currentWeaponPower = calculateWeaponPowerUsed(ship);
+        
+        if (newPower > currentWeaponPower) {
+          // Adding power - auto-allocate to weapons in order
+          let powerToAdd = newPower - currentWeaponPower;
+          
+          for (let i = 0; i < updatedWeapons.length && powerToAdd > 0; i++) {
+            const weapon = updatedWeapons[i];
+            const canAdd = weapon.powerRequired - weapon.currentPower;
+            if (canAdd > 0) {
+              const addToThis = Math.min(canAdd, powerToAdd);
+              const newWeaponPower = weapon.currentPower + addToThis;
+              updatedWeapons[i] = {
+                ...weapon,
+                currentPower: newWeaponPower,
+                powered: newWeaponPower === weapon.powerRequired,
+                currentCharge: newWeaponPower === weapon.powerRequired ? weapon.currentCharge : 0,
+              };
+              powerToAdd -= addToThis;
+            }
+          }
+        } else if (newPower < currentWeaponPower) {
+          // Removing power - remove from weapons in reverse order
+          let powerToRemove = currentWeaponPower - newPower;
+          
+          for (let i = updatedWeapons.length - 1; i >= 0 && powerToRemove > 0; i--) {
+            const weapon = updatedWeapons[i];
+            if (weapon.currentPower > 0) {
+              const removeFromThis = Math.min(weapon.currentPower, powerToRemove);
+              updatedWeapons[i] = {
+                ...weapon,
+                currentPower: weapon.currentPower - removeFromThis,
+                powered: false,
+                currentCharge: 0,
+              };
+              powerToRemove -= removeFromThis;
+            }
+          }
+        }
+      }
+
       const updatedSystems = {
         ...ship.systems,
         [systemType]: { ...system, powerCurrent: newPower },
@@ -125,6 +173,7 @@ export const useGameStore = create<GameState & GameActions>((set, get) => ({
       const updatedShip = {
         ...ship,
         systems: updatedSystems,
+        weapons: updatedWeapons,
         powerUsed: calculatePowerUsed({ ...ship, systems: updatedSystems }),
         evasion: calculateEvasion({ ...ship, systems: updatedSystems }),
       };
@@ -140,34 +189,87 @@ export const useGameStore = create<GameState & GameActions>((set, get) => ({
   },
 
   toggleWeaponPower: (weaponId: string) => {
+    // Toggle between fully powered and unpowered
+    const state = get();
+    const ship = state.playerShip;
+    const weapon = ship.weapons.find(w => w.id === weaponId);
+    if (!weapon) return;
+
+    if (weapon.powered) {
+      // Remove all power
+      get().setWeaponPower(weaponId, 0);
+    } else {
+      // Add full power
+      get().setWeaponPower(weaponId, weapon.powerRequired);
+    }
+  },
+
+  setWeaponPower: (weaponId: string, power: number) => {
     set(state => {
       const ship = state.playerShip;
       const weaponIndex = ship.weapons.findIndex(w => w.id === weaponId);
       if (weaponIndex === -1) return state;
 
       const weapon = ship.weapons[weaponIndex];
-      const newPowered = !weapon.powered;
+      const newPower = Math.max(0, Math.min(power, weapon.powerRequired));
+      const powerDiff = newPower - weapon.currentPower;
+      
+      if (powerDiff === 0) return state;
 
-      // Check if we have power to enable it
-      if (newPowered) {
+      const weaponsSystem = ship.systems.weapons;
+      const currentWeaponPowerUsed = calculateWeaponPowerUsed(ship);
+      const newTotalWeaponPower = currentWeaponPowerUsed + powerDiff;
+      
+      let newSystemPower = weaponsSystem.powerCurrent;
+      
+      if (powerDiff > 0) {
+        // Adding power to weapon - need to also add to system if needed
+        if (newTotalWeaponPower > weaponsSystem.powerCurrent) {
+          // Need to increase system power
+          const neededSystemPower = newTotalWeaponPower;
+          const maxSystemPower = Math.min(weaponsSystem.powerMax, weaponsSystem.health);
+          
+          if (neededSystemPower > maxSystemPower) {
+            return state; // Weapons system can't handle this much power
+          }
+          
+          // Check reactor constraint
         const currentPowerUsed = calculatePowerUsed(ship);
-        if (currentPowerUsed + weapon.powerRequired > ship.reactor) {
-          return state; // Not enough power
+          const systemPowerIncrease = neededSystemPower - weaponsSystem.powerCurrent;
+          if (currentPowerUsed + systemPowerIncrease > ship.reactor) {
+            return state; // Not enough reactor power
+          }
+          
+          newSystemPower = neededSystemPower;
         }
+      } else {
+        // Removing power from weapon - also reduce system power to match total
+        newSystemPower = newTotalWeaponPower;
       }
 
       const updatedWeapons = [...ship.weapons];
       updatedWeapons[weaponIndex] = {
         ...weapon,
-        powered: newPowered,
-        currentCharge: newPowered ? weapon.currentCharge : 0,
+        currentPower: newPower,
+        powered: newPower === weapon.powerRequired,
+        currentCharge: newPower === weapon.powerRequired ? weapon.currentCharge : 0,
+      };
+
+      const updatedSystems = {
+        ...ship.systems,
+        weapons: { ...weaponsSystem, powerCurrent: newSystemPower },
+      };
+
+      const updatedShip = {
+          ...ship,
+        systems: updatedSystems,
+          weapons: updatedWeapons,
       };
 
       return {
         playerShip: {
-          ...ship,
-          weapons: updatedWeapons,
-          powerUsed: calculatePowerUsed({ ...ship, weapons: updatedWeapons }),
+          ...updatedShip,
+          powerUsed: calculatePowerUsed(updatedShip),
         },
       };
     });
@@ -194,18 +296,57 @@ export const useGameStore = create<GameState & GameActions>((set, get) => ({
 
       const crew = ship.crew[crewIndex];
 
-      // Find path
-      const path = findPathImproved(crew.currentRoom, targetRoomId, ship.rooms, ship.doors);
-      if (path.length === 0 && crew.currentRoom !== targetRoomId) {
+      // If crew is stationary and already in target room, do nothing
+      if (crew.currentRoom === targetRoomId && crew.task !== 'moving') {
+        return state;
+      }
+
+      // If crew is moving, we need to figure out the best path
+      // They could be anywhere between their currentRoom and their next destination
+      let startRoom = crew.currentRoom;
+      let newPath: string[] = [];
+
+      if (crew.task === 'moving' && crew.path.length > 0) {
+        // Crew is moving toward path[0]
+        const nextRoom = crew.path[0];
+        
+        // Calculate path from current room to target
+        const pathFromCurrent = findPathImproved(startRoom, targetRoomId, ship.rooms, ship.doors);
+        // Calculate path from next room to target
+        const pathFromNext = findPathImproved(nextRoom, targetRoomId, ship.rooms, ship.doors);
+        
+        // If target is the current room, just go back there
+        if (targetRoomId === startRoom) {
+          newPath = []; // Empty path means stay in current room - crew will stop when reaching it
+        }
+        // If target is the next room they're heading to, just continue
+        else if (targetRoomId === nextRoom) {
+          newPath = [];
+        }
+        // Otherwise pick the shorter path
+        else if (pathFromCurrent.length <= pathFromNext.length || pathFromNext.length === 0) {
+          // Go back to current room first, then to target
+          newPath = pathFromCurrent.slice(1);
+        } else {
+          // Continue to next room, then to target
+          newPath = [nextRoom, ...pathFromNext.slice(1)];
+        }
+      } else {
+        // Crew is stationary, calculate path normally
+        const path = findPathImproved(startRoom, targetRoomId, ship.rooms, ship.doors);
+        if (path.length === 0 && startRoom !== targetRoomId) {
         return state; // No valid path
+        }
+        newPath = path.slice(1);
       }
 
       const updatedCrew = [...ship.crew];
       updatedCrew[crewIndex] = {
         ...crew,
         targetRoom: targetRoomId,
-        path: path.slice(1), // Remove current room from path
+        path: newPath,
         task: 'moving',
+        doorWaypoint: null, // Reset door waypoint - will be set by updateCrew when needed
       };
 
       return { playerShip: { ...ship, crew: updatedCrew } };
@@ -293,10 +434,13 @@ export const useGameStore = create<GameState & GameActions>((set, get) => ({
       };
 
       // Reset weapon charge and consume missiles
+      // If autofire is off, clear target after firing
       const updatedWeapons = [...ship.weapons];
       updatedWeapons[weaponIndex] = {
         ...weapon,
         currentCharge: 0,
+        targetRoom: state.autofire ? weapon.targetRoom : null,
+        targetShipId: state.autofire ? weapon.targetShipId : null,
       };
 
       return {
@@ -313,6 +457,10 @@ export const useGameStore = create<GameState & GameActions>((set, get) => ({
 
   cancelTargeting: () => {
     set({ targetingWeaponId: null });
+  },
+
+  toggleAutofire: () => {
+    set(state => ({ autofire: !state.autofire }));
   },
 
   toggleDoor: (doorId: string) => {
@@ -359,18 +507,25 @@ export const useGameStore = create<GameState & GameActions>((set, get) => ({
       playerShip = { ...playerShip, evasion: calculateEvasion(playerShip) };
       enemyShip = { ...enemyShip, evasion: calculateEvasion(enemyShip) };
 
-      // 6. Enemy AI - fire weapons
+      // 6. Auto-fire player weapons that have targets and are charged
+      let missiles = currentState.missiles;
+      const autofireResult = processAutofire(playerShip, enemyShip, projectiles, missiles, currentState.autofire);
+      playerShip = autofireResult.playerShip;
+      projectiles = autofireResult.projectiles;
+      missiles -= autofireResult.missilesUsed;
+
+      // 7. Enemy AI - fire weapons
       const enemyFireResult = processEnemyFire(enemyShip, playerShip, projectiles);
       enemyShip = enemyFireResult.ship;
       projectiles = enemyFireResult.projectiles;
 
-      // 7. Update projectiles and handle hits
+      // 8. Update projectiles and handle hits
       const projectileResult = updateProjectiles(projectiles, playerShip, enemyShip, deltaTime);
       projectiles = projectileResult.projectiles;
       playerShip = projectileResult.playerShip;
       enemyShip = projectileResult.enemyShip;
 
-      // 8. Check win/lose conditions
+      // 9. Check win/lose conditions
       let gameOver = false;
       let victory = false;
 
@@ -386,6 +541,7 @@ export const useGameStore = create<GameState & GameActions>((set, get) => ({
         playerShip,
         enemyShip,
         projectiles,
+        missiles,
         gameOver,
         victory,
         paused: gameOver ? true : currentState.paused,
@@ -408,6 +564,77 @@ function updateWeapons(ship: Ship, dt: number): Ship {
   });
 
   return { ...ship, weapons: updatedWeapons };
+}
+
+function processAutofire(
+  player: Ship,
+  enemy: Ship,
+  projectiles: Projectile[],
+  missiles: number,
+  keepTargetAfterFiring: boolean
+): { playerShip: Ship; projectiles: Projectile[]; missilesUsed: number } {
+  const updatedWeapons = [...player.weapons];
+  const newProjectiles = [...projectiles];
+  let missilesUsed = 0;
+
+  for (let i = 0; i < updatedWeapons.length; i++) {
+    const weapon = updatedWeapons[i];
+    
+    // Skip if not ready to fire
+    if (!weapon.powered) continue;
+    if (weapon.currentCharge < weapon.chargeTime) continue;
+    if (!weapon.targetRoom || !weapon.targetShipId) continue;
+    
+    // Check missile cost
+    if (weapon.missilesCost > 0 && missiles - missilesUsed < weapon.missilesCost) continue;
+
+    const targetRoom = enemy.rooms.find(r => r.id === weapon.targetRoom);
+    if (!targetRoom) continue;
+
+    // Fire the weapon!
+    const startPos = {
+      x: player.position.x + 50,
+      y: player.position.y + 80,
+    };
+    const endPos = getRoomCenter(targetRoom, enemy.position.x, enemy.position.y);
+
+    const projectile: Projectile = {
+      id: generateId('proj'),
+      weaponType: weapon.type,
+      damage: weapon.damage,
+      sourceShipId: player.id,
+      targetShipId: enemy.id,
+      targetRoomId: weapon.targetRoom,
+      position: { ...startPos },
+      startPosition: startPos,
+      endPosition: endPos,
+      state: 'flying',
+      progress: 0,
+      speed: BALANCE.PROJECTILE_SPEED,
+    };
+
+    newProjectiles.push(projectile);
+    
+    // Reset weapon charge and optionally clear target
+    updatedWeapons[i] = { 
+      ...weapon, 
+      currentCharge: 0,
+      // If autofire is off, clear target after firing
+      targetRoom: keepTargetAfterFiring ? weapon.targetRoom : null,
+      targetShipId: keepTargetAfterFiring ? weapon.targetShipId : null,
+    };
+    
+    // Track missile usage
+    if (weapon.missilesCost > 0) {
+      missilesUsed += weapon.missilesCost;
+    }
+  }
+
+  return {
+    playerShip: { ...player, weapons: updatedWeapons },
+    projectiles: newProjectiles,
+    missilesUsed,
+  };
 }
 
 function updateShields(ship: Ship, dt: number): Ship {
@@ -435,51 +662,135 @@ function updateShields(ship: Ship, dt: number): Ship {
 function updateCrew(ship: Ship, dt: number): Ship {
   const updatedCrew = ship.crew.map(crew => {
     if (crew.task !== 'moving' || !crew.targetRoom) return crew;
-    if (crew.path.length === 0 && crew.currentRoom === crew.targetRoom) {
-      // Arrived at destination
-      return { ...crew, task: 'idle' as const, targetRoom: null };
-    }
 
-    // Get next room in path
-    const nextRoom = crew.path[0];
-    if (!nextRoom) {
-      return { ...crew, task: 'idle' as const, targetRoom: null };
-    }
-
+    // Determine the room we're moving toward
+    const nextRoom = crew.path.length > 0 ? crew.path[0] : crew.targetRoom;
+    
     const targetRoomData = ship.rooms.find(r => r.id === nextRoom);
-    if (!targetRoomData) return crew;
+    if (!targetRoomData) {
+      return { ...crew, task: 'idle' as const, targetRoom: null, doorWaypoint: null };
+    }
 
-    const targetPos = getRoomCenter(targetRoomData, ship.position.x, ship.position.y);
+    // If we're moving to a different room, we need to go through a door first
+    const isChangingRoom = nextRoom !== crew.currentRoom;
+    
+    // If changing rooms and no door waypoint set, find and set the door waypoint
+    if (isChangingRoom && !crew.doorWaypoint) {
+      const door = findDoorBetweenRooms(crew.currentRoom, nextRoom, ship.doors);
+      if (door && door.isOpen) {
+        const doorPos = getDoorPixelPosition(door, ship.position.x, ship.position.y);
+        return {
+          ...crew,
+          doorWaypoint: doorPos,
+        };
+      } else {
+        // No door or door is closed - can't move
+        return { ...crew, task: 'idle' as const, targetRoom: null, path: [], doorWaypoint: null };
+      }
+    }
+
+    // Determine target position: door waypoint or tile in room
+    let targetPos: { x: number; y: number };
+    let isMovingToDoor = false;
+
+    if (crew.doorWaypoint) {
+      // Move to door first
+      targetPos = crew.doorWaypoint;
+      isMovingToDoor = true;
+    } else {
+      // Move to tile in current target room
+      // Find an available tile in the target room (not occupied by other crew)
+      const totalTiles = targetRoomData.width * targetRoomData.height;
+      const occupiedTiles = new Set<number>();
+      
+      // Check which tiles are occupied by other crew in this room
+      ship.crew.forEach(c => {
+        if (c.id !== crew.id && c.currentRoom === nextRoom) {
+          const tileX = Math.floor((c.position.x - ship.position.x) / RENDER.TILE_SIZE - targetRoomData.gridX);
+          const tileY = Math.floor((c.position.y - ship.position.y) / RENDER.TILE_SIZE - targetRoomData.gridY);
+          const tileIndex = tileY * targetRoomData.width + tileX;
+          if (tileIndex >= 0 && tileIndex < totalTiles) {
+            occupiedTiles.add(tileIndex);
+          }
+        }
+      });
+
+      // Prefer manning tile if room has a system and manning tile is available
+      let availableTile = 0;
+      if (targetRoomData.system !== null && !occupiedTiles.has(targetRoomData.manningTileIndex)) {
+        // Go to manning tile if available
+        availableTile = targetRoomData.manningTileIndex;
+      } else {
+        // Find first available tile
+        for (let i = 0; i < totalTiles; i++) {
+          if (!occupiedTiles.has(i)) {
+            availableTile = i;
+            break;
+          }
+        }
+      }
+
+      targetPos = getRoomTilePosition(targetRoomData, ship.position.x, ship.position.y, availableTile);
+    }
+
     const dx = targetPos.x - crew.position.x;
     const dy = targetPos.y - crew.position.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
 
     if (dist < 5) {
-      // Reached next room
-      const newPath = crew.path.slice(1);
-      const newRoom = nextRoom;
-
-      // Update room crew lists
+      if (isMovingToDoor) {
+        // Reached the door, now we can enter the next room
+        // Clear door waypoint and update current room
       const oldRoom = ship.rooms.find(r => r.id === crew.currentRoom);
       if (oldRoom) {
         oldRoom.crewInRoom = oldRoom.crewInRoom.filter(id => id !== crew.id);
       }
+        if (!targetRoomData.crewInRoom.includes(crew.id)) {
       targetRoomData.crewInRoom.push(crew.id);
+        }
+
+        const newPath = crew.path.length > 0 ? crew.path.slice(1) : [];
 
       return {
         ...crew,
-        currentRoom: newRoom,
+          currentRoom: nextRoom,
         path: newPath,
-        task: newPath.length === 0 ? 'idle' as const : 'moving' as const,
-        targetRoom: newPath.length === 0 ? null : crew.targetRoom,
+          doorWaypoint: null, // Clear door waypoint - will set new one if needed
         position: targetPos,
       };
+      } else {
+        // Reached the tile in the room
+        const newPath = crew.path.length > 0 ? crew.path.slice(1) : [];
+        const reachedFinalDestination = nextRoom === crew.targetRoom && newPath.length === 0;
+
+        return {
+          ...crew,
+          currentRoom: nextRoom,
+          path: newPath,
+          task: reachedFinalDestination ? 'idle' as const : 'moving' as const,
+          targetRoom: reachedFinalDestination ? null : crew.targetRoom,
+          position: targetPos,
+          doorWaypoint: null,
+        };
+      }
     }
 
-    // Move towards next room
+    // Move towards target position - cardinal directions only (no diagonal)
     const moveSpeed = BALANCE.CREW_MOVE_SPEED * dt;
-    const moveX = (dx / dist) * moveSpeed;
-    const moveY = (dy / dist) * moveSpeed;
+    const absDx = Math.abs(dx);
+    const absDy = Math.abs(dy);
+    
+    let moveX = 0;
+    let moveY = 0;
+    
+    // Move in the direction with greater distance first (cardinal only)
+    if (absDx > absDy) {
+      // Move horizontally
+      moveX = Math.sign(dx) * Math.min(moveSpeed, absDx);
+    } else {
+      // Move vertically
+      moveY = Math.sign(dy) * Math.min(moveSpeed, absDy);
+    }
 
     return {
       ...crew,
@@ -495,21 +806,72 @@ function updateCrew(ship: Ship, dt: number): Ship {
 
 function updateManning(ship: Ship): Ship {
   const updatedSystems = { ...ship.systems };
+  const updatedCrew = [...ship.crew];
 
+  // First, reset all manning tasks to idle (except moving crew)
+  updatedCrew.forEach((crew, index) => {
+    if (crew.task === 'manning') {
+      updatedCrew[index] = { ...crew, task: 'idle' as const };
+    }
+  });
+
+  // Then check manning for each system room
   for (const systemType of Object.keys(updatedSystems) as SystemType[]) {
     const system = updatedSystems[systemType];
     const room = ship.rooms.find(r => r.id === system.roomId);
     if (!room) continue;
 
-    const hasCrew = room.crewInRoom.some(crewId => {
-      const crew = ship.crew.find(c => c.id === crewId);
-      return crew && crew.task !== 'moving';
+    // Find crew members in this room
+    const crewInRoom = updatedCrew.filter(crew => 
+      room.crewInRoom.includes(crew.id) && 
+      crew.isPlayer === ship.isPlayer
+    );
+
+    // Find crew member on the manning tile
+    const manningCrewIndex = updatedCrew.findIndex(crew => {
+      if (!room.crewInRoom.includes(crew.id)) return false;
+      if (crew.task === 'moving') return false;
+      if (crew.isPlayer !== ship.isPlayer) return false;
+      
+      // Check if crew is on the manning tile
+      return isCrewOnManningTile(crew.position, room, ship.position.x, ship.position.y);
     });
 
-    updatedSystems[systemType] = { ...system, manned: hasCrew };
+    if (manningCrewIndex !== -1) {
+      // Crew is on manning tile - mark as manning
+      updatedCrew[manningCrewIndex] = { 
+        ...updatedCrew[manningCrewIndex], 
+        task: 'manning' as const 
+      };
+      updatedSystems[systemType] = { ...system, manned: true };
+    } else {
+      // No one on manning tile - find idle crew in room to move to manning tile
+      updatedSystems[systemType] = { ...system, manned: false };
+      
+      // Find an idle crew member in the room to auto-move to manning tile
+      const idleCrewIndex = updatedCrew.findIndex(crew =>
+        room.crewInRoom.includes(crew.id) &&
+        crew.task === 'idle' &&
+        crew.isPlayer === ship.isPlayer &&
+        !isCrewOnManningTile(crew.position, room, ship.position.x, ship.position.y)
+      );
+
+      if (idleCrewIndex !== -1) {
+        // Move this crew to the manning tile position
+        const manningPos = getManningTilePosition(room, ship.position.x, ship.position.y);
+        updatedCrew[idleCrewIndex] = {
+          ...updatedCrew[idleCrewIndex],
+          task: 'moving' as const,
+          targetRoom: room.id,
+          path: [],
+          doorWaypoint: null,
+        };
+        // Set their position target - they'll move to manning tile
+      }
+    }
   }
 
-  return { ...ship, systems: updatedSystems };
+  return { ...ship, systems: updatedSystems, crew: updatedCrew };
 }
 
 function processEnemyFire(
@@ -585,28 +947,35 @@ function updateProjectiles(
     const progressInc = (proj.speed * dt) / totalDist;
     const newProgress = proj.progress + progressInc;
 
-    if (newProgress >= 1) {
-      // Projectile reached target
       const targetShip = proj.targetShipId === playerShip.id ? updatedPlayer : updatedEnemy;
 
-      // Check evasion (missiles ignore evasion for simplicity in MVP)
-      const evaded = proj.weaponType !== 'missile' && !checkHit(targetShip.evasion);
+    // Calculate shield intersection point (approximately 75% of the way there for visual effect)
+    // Shields form an ellipse around the ship, projectiles should stop at the shield edge
+    const shieldStopProgress = 0.85; // Stop at shield boundary (before reaching room center)
 
-      if (evaded) {
-        // Missed
-        continue; // Remove projectile
-      }
-
-      // Check shields (missiles ignore shields)
-      if (proj.weaponType !== 'missile' && targetShip.shieldLayers > 0) {
-        // Blocked by shields
+    // Check if projectile should be stopped by shields
+    if (proj.weaponType !== 'missile' && targetShip.shieldLayers > 0 && newProgress >= shieldStopProgress) {
+      // Blocked by shields - projectile stops at shield boundary
         if (proj.targetShipId === playerShip.id) {
           updatedPlayer = { ...updatedPlayer, shieldLayers: updatedPlayer.shieldLayers - 1 };
         } else {
           updatedEnemy = { ...updatedEnemy, shieldLayers: updatedEnemy.shieldLayers - 1 };
         }
+      continue; // Remove projectile - it stopped at shields
+    }
+
+    if (newProgress >= 1) {
+      // Projectile reached target room
+
+      // Check evasion (missiles ignore evasion for simplicity in MVP)
+      const evaded = proj.weaponType !== 'missile' && !checkHit(targetShip.evasion);
+
+      if (evaded) {
+        // Missed - projectile disappears at target
         continue; // Remove projectile
       }
+
+      // Shields already checked above, so if we get here, projectile hits the room
 
       // Deal damage
       const targetRoom = targetShip.rooms.find(r => r.id === proj.targetRoomId);
@@ -665,3 +1034,4 @@ function updateProjectiles(
     enemyShip: updatedEnemy,
   };
 }
+

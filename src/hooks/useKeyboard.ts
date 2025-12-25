@@ -9,7 +9,6 @@ export function useKeyboard() {
   const {
     togglePause,
     cycleCrewSelection,
-    fireWeapon,
     startTargeting,
     cancelTargeting,
     playerShip,
@@ -49,7 +48,7 @@ export function useKeyboard() {
           }
           break;
 
-        // Weapon hotkeys 1-4
+        // Weapon hotkeys 1-4 - always start targeting mode
         case 'Digit1':
         case 'Digit2':
         case 'Digit3':
@@ -57,12 +56,8 @@ export function useKeyboard() {
           if (gameStarted && !gameOver) {
             const weaponIndex = parseInt(event.code.replace('Digit', '')) - 1;
             const weapon = playerShip.weapons[weaponIndex];
-            if (weapon) {
-              if (weapon.targetRoom && weapon.currentCharge >= weapon.chargeTime) {
-                fireWeapon(weapon.id);
-              } else if (!weapon.targetRoom) {
-                startTargeting(weapon.id);
-              }
+            if (weapon && weapon.powered) {
+              startTargeting(weapon.id);
             }
           }
           break;
@@ -74,7 +69,6 @@ export function useKeyboard() {
   }, [
     togglePause,
     cycleCrewSelection,
-    fireWeapon,
     startTargeting,
     cancelTargeting,
     playerShip,
